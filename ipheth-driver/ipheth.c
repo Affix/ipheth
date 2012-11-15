@@ -44,6 +44,7 @@
  */
 
 #include <linux/kernel.h>
+#include <linux/version.h>
 #include <linux/errno.h>
 #include <linux/init.h>
 #include <linux/slab.h>
@@ -54,17 +55,24 @@
 #include <linux/usb.h>
 #include <linux/workqueue.h>
 
+#if (LINUX_VERSION_CODE < KERNEL_VERSION(2,6,34))
+#define usb_alloc_coherent      usb_buffer_alloc
+#define usb_free_coherent       usb_buffer_free
+#endif
+
 #define USB_VENDOR_APPLE        0x05ac
 #define USB_PRODUCT_IPHONE      0x1290
 #define USB_PRODUCT_IPHONE_3G   0x1292
 #define USB_PRODUCT_IPHONE_3GS  0x1294
 #define USB_PRODUCT_IPHONE_4    0x1297
+#define USB_PRODUCT_IPHONE_4S   0x12a0
 
 #define IPHETH_USBINTF_CLASS    255
 #define IPHETH_USBINTF_SUBCLASS 253
 #define IPHETH_USBINTF_PROTO    1
 
 #define IPHETH_BUF_SIZE         1516
+#define IPHETH_IP_ALIGN         2       /* padding at front of URB */
 #define IPHETH_TX_TIMEOUT       (5 * HZ)
 
 #define IPHETH_INTFNUM          2
@@ -95,6 +103,10 @@ static struct usb_device_id ipheth_table[] = {
 		IPHETH_USBINTF_PROTO) },
 	{ USB_DEVICE_AND_INTERFACE_INFO(
 		USB_VENDOR_APPLE, USB_PRODUCT_IPHONE_4,
+		IPHETH_USBINTF_CLASS, IPHETH_USBINTF_SUBCLASS,
+		IPHETH_USBINTF_PROTO) },
+	{ USB_DEVICE_AND_INTERFACE_INFO(
+		USB_VENDOR_APPLE, USB_PRODUCT_IPHONE_4S,
 		IPHETH_USBINTF_CLASS, IPHETH_USBINTF_SUBCLASS,
 		IPHETH_USBINTF_PROTO) },
 	{ }
@@ -134,14 +146,14 @@ static int ipheth_alloc_urbs(struct ipheth_device *iphone)
 	if (rx_urb == NULL)
 		goto free_tx_urb;
 
-	tx_buf = usb_buffer_alloc(iphone->udev,
+	tx_buf = usb_alloc_coherent(iphone->udev,
 				  IPHETH_BUF_SIZE,
 				  GFP_KERNEL,
 				  &tx_urb->transfer_dma);
 	if (tx_buf == NULL)
 		goto free_rx_urb;
 
-	rx_buf = usb_buffer_alloc(iphone->udev,
+	rx_buf = usb_alloc_coherent(iphone->udev,
 				  IPHETH_BUF_SIZE,
 				  GFP_KERNEL,
 				  &rx_urb->transfer_dma);
@@ -156,7 +168,7 @@ static int ipheth_alloc_urbs(struct ipheth_device *iphone)
 	return 0;
 
 free_tx_buf:
-	usb_buffer_free(iphone->udev, IPHETH_BUF_SIZE, tx_buf,
+	usb_free_coherent(iphone->udev, IPHETH_BUF_SIZE, tx_buf,
 			tx_urb->transfer_dma);
 free_rx_urb:
 	usb_free_urb(rx_urb);
@@ -168,9 +180,9 @@ error_nomem:
 
 static void ipheth_free_urbs(struct ipheth_device *iphone)
 {
-	usb_buffer_free(iphone->udev, IPHETH_BUF_SIZE, iphone->rx_buf,
+	usb_free_coherent(iphone->udev, IPHETH_BUF_SIZE, iphone->rx_buf,
 			iphone->rx_urb->transfer_dma);
-	usb_buffer_free(iphone->udev, IPHETH_BUF_SIZE, iphone->tx_buf,
+	usb_free_coherent(iphone->udev, IPHETH_BUF_SIZE, iphone->tx_buf,
 			iphone->tx_urb->transfer_dma);
 	usb_free_urb(iphone->rx_urb);
 	usb_free_urb(iphone->tx_urb);
@@ -207,18 +219,21 @@ static void ipheth_rcvbulk_callback(struct urb *urb)
 		return;
 	}
 
-	len = urb->actual_length;
-	buf = urb->transfer_buffer;
+	if (urb->actual_length <= IPHETH_IP_ALIGN) {
+		dev->stats.rx_length_errors++;
+		return;
+	}
+	len = urb->actual_length - IPHETH_IP_ALIGN;
+	buf = urb->transfer_buffer + IPHETH_IP_ALIGN;
 
-	skb = dev_alloc_skb(NET_IP_ALIGN + len);
+	skb = dev_alloc_skb(len);
 	if (!skb) {
 		err("%s: dev_alloc_skb: -ENOMEM", __func__);
 		dev->stats.rx_dropped++;
 		return;
 	}
 
-	skb_reserve(skb, NET_IP_ALIGN);
-	memcpy(skb_put(skb, len), buf + NET_IP_ALIGN, len - NET_IP_ALIGN);
+	memcpy(skb_put(skb, len), buf, len);
 	skb->dev = dev->net;
 	skb->protocol = eth_type_trans(skb, dev->net);
 
